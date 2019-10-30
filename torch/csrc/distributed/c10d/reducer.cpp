@@ -353,6 +353,8 @@ void Reducer::mark_bucket_ready(size_t bucket_index) {
     auto& bucket = buckets_[next_bucket_];
     std::vector<at::Tensor> tensors;
     tensors.reserve(bucket.replicas.size());
+    std::vector<at::Tensor> local_used;
+    local_used.reserve(bucket.replicas.size());
     for (const auto& replica : bucket.replicas) {
       // TODO(@pietern): Ensure proper synchronization with the CUDA events
       // that recorded copies into this contents tensor. If these copies are
@@ -364,8 +366,10 @@ void Reducer::mark_bucket_ready(size_t bucket_index) {
       // do any extra synchronization here.
       //
       tensors.push_back(replica.contents);
+      local_used.push_back(replica.local_used);
     }
     bucket.work = process_group_->allreduce(tensors);
+    bucket.work = process_group_->allreduce(local_used);
   }
 }
 
@@ -459,6 +463,11 @@ void Reducer::initialize_buckets(
         // is not recommended (or sometimes even possible) to mix and match.
         replica.contents = torch::autograd::make_variable(
             at::empty({static_cast<long>(offset)}, options));
+
+        // Allocate per-bucket tensor for locally used flags
+        options = options.dtype(at::kInt);
+        replica.local_used = torch::autograd::make_variable(
+            at::empty({bucket_indices[bucket_index].size()}, options));
       }
 
       // Add bucket replica to enclosing bucket.
@@ -525,6 +534,7 @@ void Reducer::prepare_for_backward(
   for (auto& bucket : buckets_) {
     for (auto& replica : bucket.replicas) {
       replica.pending = replica.variables.size();
+      replica.local_used.zero_();
     }
     bucket.pending = bucket.replicas.size();
   }
@@ -567,6 +577,13 @@ void Reducer::prepare_for_backward(
     // If the accumulator function is present in the graph, we know
     // a gradient will be computed for the corresponding parameter.
     if (seen.count(it.first) > 0) {
+      // Mark locally used parameters
+      const auto& var_idx = it.second;
+      const auto& var_loc = variable_locators_[var_idx.variable_index];
+      auto& bucket = buckets_[var_loc.bucket_index];
+      auto& bucket_replica = bucket.replicas[var_idx.replica_index];
+      bucket_replica.local_used[var_loc.intra_bucket_index] = 1;
+
       continue;
     }
 
@@ -583,13 +600,16 @@ void Reducer::finalize_bucket_dense(Bucket& bucket) {
       auto& variable = replica.variables[intra_bucket_index];
       const auto offset = replica.offsets[intra_bucket_index];
       const auto length = replica.lengths[intra_bucket_index];
+      bool global_unused = replica.local_used[intra_bucket_index].item<int>() == 0;
       auto bucket_view =
           replica.contents.narrow(0, offset, length).view(variable.sizes());
       auto& grad = variable.grad();
-      if (!grad.defined()) {
-        grad = at::empty(bucket_view.sizes(), bucket_view.options());
+      if (!global_unused) {
+        if (!grad.defined()) {
+          grad = at::empty(bucket_view.sizes(), bucket_view.options());
+        }
+        grad.copy_(bucket_view);
       }
-      grad.copy_(bucket_view);
     }
   }
 }

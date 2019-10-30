@@ -115,6 +115,11 @@ class Reducer {
     std::vector<size_t> offsets;
     std::vector<size_t> lengths;
 
+    // Per-bucket tensor for indicating if variable is used locally during the
+    // current iteration. This tensor will be allreduced for figuring out the
+    // globally unused parameters. 1 means locally used and 0 locally unused.
+    at::Tensor local_used;
+
     // Number of tensors to be added before this bucket is complete.
     // This is reset to `variables.size()` every iteration.
     size_t pending;
